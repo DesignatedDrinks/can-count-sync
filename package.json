@@ -1,0 +1,21 @@
+{
+  "name": "can-count-sync",
+  "version": "1.0.0",
+  "description": "Designated Drinks can-count inventory sync for Shopify pack variants.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "locations": "node src/index.js locations",
+    "import:variants": "node src/index.js import-variants",
+    "promote:mapping": "node src/index.js promote-mapping",
+    "sync:preview": "node src/index.js sync-preview",
+    "sync": "node src/index.js sync",
+    "server": "node src/server.js",
+    "test": "node src/index.js test"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.19.2",
+    "googleapis": "^140.0.1"
+  }
+}
