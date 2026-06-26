@@ -31,12 +31,13 @@ real cans available -> calculate Single / 4-Pack / 12-Pack availability -> sync 
 ## Files
 
 ```text
-can_count_sync_proper_template.xlsx   Google Sheet template
-src/                                  app code
-scripts/                              command-line scripts
-docs/                                 setup instructions
-.env.example                          environment variable example
+src/           app code
+docs/          setup instructions
+.env.example   environment variable example
+package.json   command scripts and dependencies
 ```
+
+The Google Sheet template is provided separately as `can_count_sync_proper_template.xlsx`. Upload it to Google Drive and open it as a Google Sheet.
 
 ## Commands
 
@@ -65,7 +66,7 @@ Single inventory = floor(237 / 1) = 237
 
 When new products or variants are added in Shopify:
 
-1. Run `npm run import:variants`, or let the `products/create` / `products/update` webhook run it.
+1. Run `npm run import:variants`, or let the product webhook trigger registration later.
 2. New variants go to `Needs Mapping`.
 3. Confirm `proposed_base_sku` and `proposed_pack_size`.
 4. Change status to `ready_to_promote`.
