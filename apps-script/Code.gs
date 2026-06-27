@@ -37,6 +37,18 @@ function ccsSetupTabs() {
   SpreadsheetApp.getUi().alert('Simple Can Count Sync tabs are ready. Use Pack Mapping only. Old Base Products / Ledger tabs can be ignored.');
 }
 
+function ccsSetupTabsSilent() {
+  const ss = SpreadsheetApp.getActive();
+  Object.keys(CCS.tabs).forEach(key => {
+    let sh = ss.getSheetByName(CCS.tabs[key]);
+    if (!sh) {
+      sh = ss.insertSheet(CCS.tabs[key]);
+      sh.getRange(1, 1, 1, CCS.headers[key].length).setValues([CCS.headers[key]]);
+      sh.setFrozenRows(1);
+    }
+  });
+}
+
 function ccsProps() {
   return PropertiesService.getScriptProperties();
 }
@@ -103,12 +115,14 @@ function ccsGraphql(query, variables) {
   const url = 'https://' + ccsShop() + '.myshopify.com/admin/api/' + version + '/graphql.json';
   const headers = { 'Content-Type': 'application/json' };
   headers['X-Shopify-Access-Token'] = ccsToken();
+
   const res = UrlFetchApp.fetch(url, {
     method: 'post',
     headers: headers,
     payload: JSON.stringify({ query: query, variables: variables || {} }),
     muteHttpExceptions: true
   });
+
   const text = res.getContentText();
   let body;
   try {
@@ -116,7 +130,11 @@ function ccsGraphql(query, variables) {
   } catch (err) {
     throw new Error('Shopify returned non-JSON. Check app install and shop value. First 300 chars: ' + text.slice(0, 300));
   }
-  if (res.getResponseCode() >= 300 || body.errors) throw new Error('Shopify GraphQL error: ' + text);
+
+  if (res.getResponseCode() >= 300 || body.errors) {
+    throw new Error('Shopify GraphQL error: ' + text);
+  }
+
   return body.data;
 }
 
@@ -177,19 +195,18 @@ function ccsAvailableFromNode(v) {
 
 function ccsInferPackSize(variantTitle, sku, productTitle) {
   const text = (String(productTitle || '') + ' ' + String(variantTitle || '') + ' ' + String(sku || '')).toLowerCase();
-  if (text.indexOf('24-pack') >= 0 || text.indexOf('24 pack') >= 0 || text.indexOf('24pk') >= 0) return 24;
-  if (text.indexOf('12-pack') >= 0 || text.indexOf('12 pack') >= 0 || text.indexOf('12pk') >= 0) return 12;
-  if (text.indexOf('6-pack') >= 0 || text.indexOf('6 pack') >= 0 || text.indexOf('6pk') >= 0) return 6;
-  if (text.indexOf('4-pack') >= 0 || text.indexOf('4 pack') >= 0 || text.indexOf('4pk') >= 0) return 4;
-  if (text.indexOf('single') >= 0 || text.indexOf('1-pack') >= 0 || text.indexOf('1 pack') >= 0 || text.indexOf(' can') >= 0 || text.indexOf('can ') >= 0) return 1;
-  if (/\b(250|330|341|355|473|500)\s*ml\b/.test(text)) return 1;
-  if (/\b(250|330|341|355|473|500)ml\b/.test(text)) return 1;
+  if (/\b([0-9]+)\s*(?:x\s*)?-?\s*pack\b/.test(text)) return Number(text.match(/\b([0-9]+)\s*(?:x\s*)?-?\s*pack\b/)[1]);
+  if (/\b([0-9]+)\s*pk\b/.test(text)) return Number(text.match(/\b([0-9]+)\s*pk\b/)[1]);
+  if (/\bsingle\b/.test(text) || /\bcan\b/.test(text)) return 1;
+  if (/\b(237|250|330|341|355|440|473|500)\s*ml\b/.test(text)) return 1;
+  if (/\b(237|250|330|341|355|440|473|500)ml\b/.test(text)) return 1;
   return '';
 }
 
 function ccsProposeGroup(productTitle, sku) {
   return String(productTitle || sku || '').toUpperCase()
     .replace(/\(NON-ALCOHOLIC\)/g, '')
+    .replace(/\(NON ALCOHOLIC\)/g, '')
     .replace(/[^A-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 60);
@@ -199,6 +216,7 @@ function ccsFetchShopifyVariants() {
   const query = 'query ProductVariants($cursor: String, $locationId: ID!) { productVariants(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { id title sku price product { title } inventoryItem { id sku tracked inventoryLevel(locationId: $locationId) { quantities(names: ["available"]) { name quantity } } } } } }';
   let cursor = null;
   const rows = [];
+
   do {
     const data = ccsGraphql(query, { cursor: cursor, locationId: ccsGet('SHOPIFY_LOCATION_ID') });
     data.productVariants.nodes.forEach(v => {
@@ -215,6 +233,7 @@ function ccsFetchShopifyVariants() {
     });
     cursor = data.productVariants.pageInfo.hasNextPage ? data.productVariants.pageInfo.endCursor : null;
   } while (cursor);
+
   return rows;
 }
 
@@ -236,7 +255,7 @@ function ccsRefreshMappingRows(writeSheet) {
     const inferredPack = ccsInferPackSize(v.variant_title, v.sku, v.product_title);
     const oldPack = String(old.pack_size || '').trim();
     const packSize = oldPack || inferredPack;
-    const masterValue = ccsYes(old.is_master) || String(packSize) === '1' ? 'TRUE' : 'FALSE';
+    const masterValue = (ccsYes(old.is_master) || String(packSize) === '1') ? 'TRUE' : 'FALSE';
     return {
       sync_group: old.sync_group || ccsProposeGroup(v.product_title, v.sku),
       product_title: v.product_title,
@@ -263,18 +282,6 @@ function ccsRefreshMappingRows(writeSheet) {
 
   if (writeSheet) ccsWriteRows(CCS.tabs.mapping, CCS.headers.mapping, rows);
   return rows;
-}
-
-function ccsSetupTabsSilent() {
-  const ss = SpreadsheetApp.getActive();
-  Object.keys(CCS.tabs).forEach(key => {
-    let sh = ss.getSheetByName(CCS.tabs[key]);
-    if (!sh) {
-      sh = ss.insertSheet(CCS.tabs[key]);
-      sh.getRange(1, 1, 1, CCS.headers[key].length).setValues([CCS.headers[key]]);
-      sh.setFrozenRows(1);
-    }
-  });
 }
 
 function ccsPreviewPackSync() {
@@ -330,6 +337,7 @@ function ccsRunPackSync(mode) {
         return;
       }
 
+      const currentAvailable = ccsNumber(r.shopify_available);
       const target = Math.floor(totalCans / pack);
       r.target_available = target;
       let status = 'preview';
@@ -337,8 +345,8 @@ function ccsRunPackSync(mode) {
 
       if (mode === 'live') {
         try {
-          if (ccsNumber(r.shopify_available) !== target) {
-            ccsSetInventory(r.inventory_item_id, target);
+          if (currentAvailable !== target) {
+            ccsSetInventory(r.inventory_item_id, target, currentAvailable);
             r.shopify_available = target;
             status = 'success';
             message = 'Updated Shopify inventory';
@@ -359,7 +367,7 @@ function ccsRunPackSync(mode) {
         product_title: r.product_title,
         variant_title: r.variant_title,
         pack_size: pack,
-        shopify_available: r.shopify_available,
+        shopify_available: currentAvailable,
         target_available: target,
         status: status,
         message: message
@@ -372,15 +380,22 @@ function ccsRunPackSync(mode) {
   SpreadsheetApp.getUi().alert(mode === 'live' ? 'Live pack sync complete. Check Sync Log.' : 'Preview complete. Check target_available and Sync Log.');
 }
 
-function ccsSetInventory(inventoryItemId, quantity) {
-  const mutation = 'mutation InventorySet($input: InventorySetQuantitiesInput!) { inventorySetQuantities(input: $input) { userErrors { field message code } } }';
+function ccsSetInventory(inventoryItemId, quantity, changeFromQuantity) {
+  const mutation = 'mutation InventorySet($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) { inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) { userErrors { field message code } } }';
+  const idempotencyKey = Utilities.getUuid();
   const input = {
     name: 'available',
     reason: 'correction',
-    referenceDocumentUri: 'can-count-sync://' + new Date().getTime(),
-    quantities: [{ inventoryItemId: inventoryItemId, locationId: ccsGet('SHOPIFY_LOCATION_ID'), quantity: Number(quantity) }]
+    referenceDocumentUri: 'can-count-sync://' + idempotencyKey,
+    quantities: [{
+      inventoryItemId: inventoryItemId,
+      locationId: ccsGet('SHOPIFY_LOCATION_ID'),
+      quantity: Number(quantity),
+      changeFromQuantity: Number(changeFromQuantity)
+    }]
   };
-  const data = ccsGraphql(mutation, { input: input });
+
+  const data = ccsGraphql(mutation, { input: input, idempotencyKey: idempotencyKey });
   const errors = data.inventorySetQuantities.userErrors || [];
   if (errors.length) throw new Error(JSON.stringify(errors));
 }
@@ -435,7 +450,7 @@ function ccsProcessRecentOrders() {
     const current = ccsNumber(adj.row.shopify_available);
     const next = Math.max(0, current - adj.quantity);
     try {
-      ccsSetInventory(adj.row.inventory_item_id, next);
+      ccsSetInventory(adj.row.inventory_item_id, next, current);
       logRows.push({ timestamp: new Date(), mode: 'order_adjust', sync_group: adj.row.sync_group, product_title: adj.row.product_title, variant_title: adj.row.variant_title, pack_size: adj.row.pack_size, shopify_available: current, target_available: next, status: 'success', message: 'Master adjusted for pack order: ' + adj.notes.join('; ') });
     } catch (err) {
       logRows.push({ timestamp: new Date(), mode: 'order_adjust', sync_group: adj.row.sync_group, product_title: adj.row.product_title, variant_title: adj.row.variant_title, pack_size: adj.row.pack_size, shopify_available: current, target_available: next, status: 'error', message: err.message });
