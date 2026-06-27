@@ -175,13 +175,15 @@ function ccsAvailableFromNode(v) {
   return 0;
 }
 
-function ccsInferPackSize(title, sku) {
-  const text = (String(title || '') + ' ' + String(sku || '')).toLowerCase();
+function ccsInferPackSize(variantTitle, sku, productTitle) {
+  const text = (String(productTitle || '') + ' ' + String(variantTitle || '') + ' ' + String(sku || '')).toLowerCase();
   if (text.indexOf('24-pack') >= 0 || text.indexOf('24 pack') >= 0 || text.indexOf('24pk') >= 0) return 24;
   if (text.indexOf('12-pack') >= 0 || text.indexOf('12 pack') >= 0 || text.indexOf('12pk') >= 0) return 12;
   if (text.indexOf('6-pack') >= 0 || text.indexOf('6 pack') >= 0 || text.indexOf('6pk') >= 0) return 6;
   if (text.indexOf('4-pack') >= 0 || text.indexOf('4 pack') >= 0 || text.indexOf('4pk') >= 0) return 4;
-  if (text.indexOf('single') >= 0 || text.indexOf('1-pack') >= 0 || text.indexOf('1 pack') >= 0) return 1;
+  if (text.indexOf('single') >= 0 || text.indexOf('1-pack') >= 0 || text.indexOf('1 pack') >= 0 || text.indexOf(' can') >= 0 || text.indexOf('can ') >= 0) return 1;
+  if (/\b(250|330|341|355|473|500)\s*ml\b/.test(text)) return 1;
+  if (/\b(250|330|341|355|473|500)ml\b/.test(text)) return 1;
   return '';
 }
 
@@ -231,8 +233,10 @@ function ccsRefreshMappingRows(writeSheet) {
   const live = ccsFetchShopifyVariants();
   const rows = live.map(v => {
     const old = existing[String(v.variant_gid)] || {};
-    const inferredPack = ccsInferPackSize(v.variant_title, v.sku);
-    const packSize = old.pack_size || inferredPack;
+    const inferredPack = ccsInferPackSize(v.variant_title, v.sku, v.product_title);
+    const oldPack = String(old.pack_size || '').trim();
+    const packSize = oldPack || inferredPack;
+    const masterValue = ccsYes(old.is_master) || String(packSize) === '1' ? 'TRUE' : 'FALSE';
     return {
       sync_group: old.sync_group || ccsProposeGroup(v.product_title, v.sku),
       product_title: v.product_title,
@@ -241,7 +245,7 @@ function ccsRefreshMappingRows(writeSheet) {
       variant_gid: v.variant_gid,
       inventory_item_id: v.inventory_item_id,
       pack_size: packSize,
-      is_master: old.is_master || (String(packSize) === '1' ? 'TRUE' : 'FALSE'),
+      is_master: masterValue,
       active: old.active || 'FALSE',
       shopify_available: v.shopify_available,
       target_available: old.target_available || '',
