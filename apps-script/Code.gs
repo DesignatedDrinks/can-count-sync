@@ -5,8 +5,8 @@ const CCS = {
     orders: 'Orders Processed'
   },
   headers: {
-    mapping: ['sync_group', 'product_title', 'variant_title', 'sku', 'variant_gid', 'inventory_item_id', 'pack_size', 'is_master', 'active', 'shopify_available', 'target_available', 'tracked', 'last_seen_at', 'notes'],
-    log: ['timestamp', 'mode', 'sync_group', 'product_title', 'variant_title', 'pack_size', 'shopify_available', 'target_available', 'status', 'message'],
+    mapping: ['sync_group', 'product_title', 'variant_title', 'sku', 'variant_gid', 'inventory_item_id', 'pack_size', 'is_master', 'active', 'shopify_available', 'master_can_count', 'target_available', 'tracked', 'last_seen_at', 'notes'],
+    log: ['timestamp', 'mode', 'sync_group', 'product_title', 'variant_title', 'pack_size', 'shopify_available', 'master_can_count', 'target_available', 'status', 'message'],
     orders: ['timestamp', 'shopify_order_id', 'shopify_order_name', 'status', 'note']
   }
 };
@@ -17,8 +17,8 @@ function onOpen() {
     .addItem('Setup Simple Tabs', 'ccsSetupTabs')
     .addSeparator()
     .addItem('Import / Refresh Shopify Variants', 'ccsImportOrRefreshMapping')
-    .addItem('Preview Pack Sync', 'ccsPreviewPackSync')
-    .addItem('Sync Pack Variants to Shopify', 'ccsLivePackSync')
+    .addItem('Preview Allocation Sync', 'ccsPreviewPackSync')
+    .addItem('Sync Allocation to Shopify', 'ccsLivePackSync')
     .addSeparator()
     .addItem('Process Recent Orders + Sync', 'ccsProcessRecentOrders')
     .addItem('Install 10 Minute Order Polling', 'ccsInstallOrderPolling')
@@ -34,7 +34,7 @@ function ccsSetupTabs() {
     sh.getRange(1, 1, 1, headers.length).setValues([headers]);
     sh.setFrozenRows(1);
   });
-  SpreadsheetApp.getUi().alert('Simple Can Count Sync tabs are ready. Use Pack Mapping only. Old Base Products / Ledger tabs can be ignored.');
+  SpreadsheetApp.getUi().alert('Simple Can Count Sync tabs are ready. The master_can_count column is the real can count. Visible Shopify inventory is allocated safely.');
 }
 
 function ccsSetupTabsSilent() {
@@ -184,6 +184,10 @@ function ccsNumber(v) {
   return isNaN(n) ? 0 : n;
 }
 
+function ccsBlank(v) {
+  return String(v === undefined || v === null ? '' : v).trim() === '';
+}
+
 function ccsAvailableFromNode(v) {
   const level = v.inventoryItem && v.inventoryItem.inventoryLevel;
   const quantities = level && level.quantities ? level.quantities : [];
@@ -195,8 +199,10 @@ function ccsAvailableFromNode(v) {
 
 function ccsInferPackSize(variantTitle, sku, productTitle) {
   const text = (String(productTitle || '') + ' ' + String(variantTitle || '') + ' ' + String(sku || '')).toLowerCase();
-  if (/\b([0-9]+)\s*(?:x\s*)?-?\s*pack\b/.test(text)) return Number(text.match(/\b([0-9]+)\s*(?:x\s*)?-?\s*pack\b/)[1]);
-  if (/\b([0-9]+)\s*pk\b/.test(text)) return Number(text.match(/\b([0-9]+)\s*pk\b/)[1]);
+  const packMatch = text.match(/\b([0-9]+)\s*(?:x\s*)?-?\s*pack\b/);
+  if (packMatch) return Number(packMatch[1]);
+  const pkMatch = text.match(/\b([0-9]+)\s*pk\b/);
+  if (pkMatch) return Number(pkMatch[1]);
   if (/\bsingle\b/.test(text) || /\bcan\b/.test(text)) return 1;
   if (/\b(237|250|330|341|355|440|473|500)\s*ml\b/.test(text)) return 1;
   if (/\b(237|250|330|341|355|440|473|500)ml\b/.test(text)) return 1;
@@ -239,7 +245,7 @@ function ccsFetchShopifyVariants() {
 
 function ccsImportOrRefreshMapping() {
   const rows = ccsRefreshMappingRows(true);
-  SpreadsheetApp.getUi().alert('Pack Mapping refreshed with ' + rows.length + ' Shopify variants. Set active=TRUE only for products you want Can Count Sync to manage.');
+  SpreadsheetApp.getUi().alert('Pack Mapping refreshed with ' + rows.length + ' Shopify variants. Use master_can_count as the real stock count before previewing or syncing.');
 }
 
 function ccsRefreshMappingRows(writeSheet) {
@@ -256,6 +262,12 @@ function ccsRefreshMappingRows(writeSheet) {
     const oldPack = String(old.pack_size || '').trim();
     const packSize = oldPack || inferredPack;
     const masterValue = (ccsYes(old.is_master) || String(packSize) === '1') ? 'TRUE' : 'FALSE';
+
+    let masterCanCount = old.master_can_count;
+    if (String(packSize) === '1' && ccsBlank(masterCanCount)) {
+      masterCanCount = v.shopify_available;
+    }
+
     return {
       sync_group: old.sync_group || ccsProposeGroup(v.product_title, v.sku),
       product_title: v.product_title,
@@ -267,6 +279,7 @@ function ccsRefreshMappingRows(writeSheet) {
       is_master: masterValue,
       active: old.active || 'FALSE',
       shopify_available: v.shopify_available,
+      master_can_count: masterCanCount,
       target_available: old.target_available || '',
       tracked: v.tracked,
       last_seen_at: new Date(),
@@ -285,11 +298,11 @@ function ccsRefreshMappingRows(writeSheet) {
 }
 
 function ccsPreviewPackSync() {
-  ccsRunPackSync('preview');
+  ccsRunPackSync('preview', false);
 }
 
 function ccsLivePackSync() {
-  ccsRunPackSync('live');
+  ccsRunPackSync('live', false);
 }
 
 function ccsFindMaster(groupRows) {
@@ -302,7 +315,94 @@ function ccsFindMaster(groupRows) {
   return active[0] || null;
 }
 
-function ccsRunPackSync(mode) {
+function ccsBuildPackSizeIndex(groupRows) {
+  const bySize = {};
+  groupRows.forEach(r => {
+    const pack = ccsNumber(r.pack_size);
+    if (!pack || !ccsYes(r.active) || !ccsYes(r.tracked)) return;
+    if (!bySize[pack]) bySize[pack] = [];
+    bySize[pack].push(r);
+  });
+  return bySize;
+}
+
+function ccsChoosePackSize(availableSizes, preferred, min, max) {
+  for (let i = 0; i < preferred.length; i++) {
+    const p = preferred[i];
+    if (availableSizes.indexOf(p) !== -1 && p >= min && p <= max) return p;
+  }
+  const candidates = availableSizes.filter(s => s >= min && s <= max).sort((a, b) => a - b);
+  return candidates.length ? candidates[0] : null;
+}
+
+function ccsAllocateSmall(totalCans, smallPackSize, hasSingle) {
+  const result = { singles: 0, smallPacks: 0 };
+  if (!smallPackSize || totalCans <= 0) {
+    result.singles = hasSingle ? totalCans : 0;
+    return result;
+  }
+
+  if (totalCans <= smallPackSize) {
+    result.singles = hasSingle ? totalCans : 0;
+    result.smallPacks = hasSingle ? 0 : Math.floor(totalCans / smallPackSize);
+    return result;
+  }
+
+  const remainder = totalCans % smallPackSize;
+  if (hasSingle) {
+    if (remainder === 0) {
+      result.singles = smallPackSize;
+      result.smallPacks = Math.floor((totalCans - smallPackSize) / smallPackSize);
+    } else {
+      result.singles = remainder;
+      result.smallPacks = Math.floor(totalCans / smallPackSize);
+    }
+  } else {
+    result.singles = 0;
+    result.smallPacks = Math.floor(totalCans / smallPackSize);
+  }
+  return result;
+}
+
+function ccsAllocateTargets(totalCans, groupRows) {
+  totalCans = Math.max(0, Math.floor(ccsNumber(totalCans)));
+  const targets = {};
+  groupRows.forEach(r => targets[String(r.variant_gid)] = 0);
+
+  const bySize = ccsBuildPackSizeIndex(groupRows);
+  const sizes = Object.keys(bySize).map(Number).sort((a, b) => a - b);
+  const hasSingle = !!bySize[1];
+
+  if (!sizes.length || totalCans <= 0) return targets;
+
+  const singleSize = hasSingle ? 1 : null;
+  const smallSize = ccsChoosePackSize(sizes, [4, 6], 2, 11);
+  const largeSize = ccsChoosePackSize(sizes, [12, 24], 12, 999);
+
+  let remaining = totalCans;
+
+  if (largeSize && totalCans >= 24) {
+    const largeCount = Math.min(4, Math.floor(totalCans / (largeSize * 2)));
+    targets[String(bySize[largeSize][0].variant_gid)] = largeCount;
+    remaining = totalCans - (largeCount * largeSize);
+  }
+
+  const smallAllocation = ccsAllocateSmall(remaining, smallSize, hasSingle);
+  if (singleSize && bySize[1] && bySize[1][0]) {
+    targets[String(bySize[1][0].variant_gid)] = smallAllocation.singles;
+  }
+  if (smallSize && bySize[smallSize] && bySize[smallSize][0]) {
+    targets[String(bySize[smallSize][0].variant_gid)] = smallAllocation.smallPacks;
+  }
+
+  if (!hasSingle && !smallSize && largeSize && targets[String(bySize[largeSize][0].variant_gid)] === 0) {
+    targets[String(bySize[largeSize][0].variant_gid)] = Math.floor(totalCans / largeSize);
+  }
+
+  return targets;
+}
+
+function ccsRunPackSync(mode, silent) {
   const rows = ccsRefreshMappingRows(false);
   const groups = {};
   rows.forEach(r => {
@@ -322,24 +422,24 @@ function ccsRunPackSync(mode) {
       return;
     }
 
-    const masterPack = ccsNumber(master.pack_size);
-    const masterQty = ccsNumber(master.shopify_available);
-    if (!masterPack) {
-      logRows.push({ timestamp: new Date(), mode: mode, sync_group: group, status: 'skipped', message: 'Master pack_size missing' });
-      return;
-    }
+    const totalCans = ccsBlank(master.master_can_count) ? ccsNumber(master.shopify_available) : ccsNumber(master.master_can_count);
+    const targets = ccsAllocateTargets(totalCans, groupRows);
 
-    const totalCans = masterQty * masterPack;
     groupRows.forEach(r => {
       const pack = ccsNumber(r.pack_size);
       if (!pack || !r.inventory_item_id || !ccsYes(r.tracked)) {
-        logRows.push({ timestamp: new Date(), mode: mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: r.pack_size, shopify_available: r.shopify_available, status: 'skipped', message: 'Missing pack_size, inventory_item_id, or tracked=FALSE' });
+        logRows.push({ timestamp: new Date(), mode: mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: r.pack_size, shopify_available: r.shopify_available, master_can_count: totalCans, status: 'skipped', message: 'Missing pack_size, inventory_item_id, or tracked=FALSE' });
         return;
       }
 
       const currentAvailable = ccsNumber(r.shopify_available);
-      const target = Math.floor(totalCans / pack);
+      const target = targets[String(r.variant_gid)] || 0;
       r.target_available = target;
+
+      if (String(r.variant_gid) === String(master.variant_gid)) {
+        r.master_can_count = totalCans;
+      }
+
       let status = 'preview';
       let message = 'No Shopify update made';
 
@@ -368,6 +468,7 @@ function ccsRunPackSync(mode) {
         variant_title: r.variant_title,
         pack_size: pack,
         shopify_available: currentAvailable,
+        master_can_count: totalCans,
         target_available: target,
         status: status,
         message: message
@@ -377,11 +478,13 @@ function ccsRunPackSync(mode) {
 
   ccsWriteRows(CCS.tabs.mapping, CCS.headers.mapping, rows);
   ccsAppend(CCS.tabs.log, CCS.headers.log, logRows);
-  SpreadsheetApp.getUi().alert(mode === 'live' ? 'Live pack sync complete. Check Sync Log.' : 'Preview complete. Check target_available and Sync Log.');
+  if (!silent) {
+    SpreadsheetApp.getUi().alert(mode === 'live' ? 'Live allocation sync complete. Check Sync Log.' : 'Preview complete. Check master_can_count, target_available, and Sync Log.');
+  }
 }
 
 function ccsSetInventory(inventoryItemId, quantity, changeFromQuantity) {
-  const mutation = 'mutation InventorySet($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) { inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) { userErrors { field message code } } }';
+  const mutation = 'mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) { inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) { inventoryAdjustmentGroup { reason referenceDocumentUri changes { name delta quantityAfterChange } } userErrors { code field message } } }';
   const idempotencyKey = Utilities.getUuid();
   const input = {
     name: 'available',
@@ -424,42 +527,58 @@ function ccsProcessRecentOrders() {
   const orderRows = [];
   data.orders.nodes.forEach(order => {
     if (processed[String(order.id)]) return;
+    let touched = false;
+
     order.lineItems.nodes.forEach(line => {
       const variantId = line.variant ? String(line.variant.id) : '';
       const sold = activeByVariant[variantId];
       if (!sold) return;
+
       const group = String(sold.sync_group || '').trim();
       const master = ccsFindMaster(groups[group] || []);
       if (!master) return;
-      if (String(master.variant_gid) === String(sold.variant_gid)) return;
 
       const soldPack = ccsNumber(sold.pack_size);
-      const masterPack = ccsNumber(master.pack_size);
-      if (!soldPack || !masterPack) return;
-      const unitsToDeductFromMaster = Math.ceil(Number(line.quantity || 0) * soldPack / masterPack);
+      if (!soldPack) return;
+
+      const cansSold = Number(line.quantity || 0) * soldPack;
       if (!adjustments[master.variant_gid]) adjustments[master.variant_gid] = { row: master, quantity: 0, notes: [] };
-      adjustments[master.variant_gid].quantity += unitsToDeductFromMaster;
-      adjustments[master.variant_gid].notes.push(order.name + ' sold ' + line.quantity + ' x ' + sold.variant_title);
+      adjustments[master.variant_gid].quantity += cansSold;
+      adjustments[master.variant_gid].notes.push(order.name + ' sold ' + line.quantity + ' x ' + sold.variant_title + ' = ' + cansSold + ' cans');
+      touched = true;
     });
-    orderRows.push({ timestamp: new Date(), shopify_order_id: order.id, shopify_order_name: order.name, status: 'processed', note: 'Checked by Can Count Sync' });
+
+    if (touched) {
+      orderRows.push({ timestamp: new Date(), shopify_order_id: order.id, shopify_order_name: order.name, status: 'processed', note: 'Adjusted master_can_count by Can Count Sync' });
+    }
   });
 
   const logRows = [];
   Object.keys(adjustments).forEach(key => {
     const adj = adjustments[key];
-    const current = ccsNumber(adj.row.shopify_available);
-    const next = Math.max(0, current - adj.quantity);
-    try {
-      ccsSetInventory(adj.row.inventory_item_id, next, current);
-      logRows.push({ timestamp: new Date(), mode: 'order_adjust', sync_group: adj.row.sync_group, product_title: adj.row.product_title, variant_title: adj.row.variant_title, pack_size: adj.row.pack_size, shopify_available: current, target_available: next, status: 'success', message: 'Master adjusted for pack order: ' + adj.notes.join('; ') });
-    } catch (err) {
-      logRows.push({ timestamp: new Date(), mode: 'order_adjust', sync_group: adj.row.sync_group, product_title: adj.row.product_title, variant_title: adj.row.variant_title, pack_size: adj.row.pack_size, shopify_available: current, target_available: next, status: 'error', message: err.message });
-    }
+    const currentMaster = ccsBlank(adj.row.master_can_count) ? ccsNumber(adj.row.shopify_available) : ccsNumber(adj.row.master_can_count);
+    const nextMaster = Math.max(0, currentMaster - adj.quantity);
+    adj.row.master_can_count = nextMaster;
+
+    logRows.push({
+      timestamp: new Date(),
+      mode: 'order_adjust',
+      sync_group: adj.row.sync_group,
+      product_title: adj.row.product_title,
+      variant_title: adj.row.variant_title,
+      pack_size: adj.row.pack_size,
+      shopify_available: adj.row.shopify_available,
+      master_can_count: currentMaster,
+      target_available: nextMaster,
+      status: 'success',
+      message: 'master_can_count adjusted from ' + currentMaster + ' to ' + nextMaster + ': ' + adj.notes.join('; ')
+    });
   });
 
+  ccsWriteRows(CCS.tabs.mapping, CCS.headers.mapping, rows);
   ccsAppend(CCS.tabs.orders, CCS.headers.orders, orderRows);
   ccsAppend(CCS.tabs.log, CCS.headers.log, logRows);
-  ccsRunPackSync('live');
+  ccsRunPackSync('live', true);
 }
 
 function ccsInstallOrderPolling() {
@@ -467,5 +586,5 @@ function ccsInstallOrderPolling() {
     if (t.getHandlerFunction() === 'ccsProcessRecentOrders') ScriptApp.deleteTrigger(t);
   });
   ScriptApp.newTrigger('ccsProcessRecentOrders').timeBased().everyMinutes(10).create();
-  SpreadsheetApp.getUi().alert('10 minute order polling is installed. It will process recent orders and then sync related pack variants.');
+  SpreadsheetApp.getUi().alert('10 minute order polling is installed. It will process recent orders, adjust master_can_count, and then sync allocated pack inventory.');
 }
