@@ -63,30 +63,7 @@ function ccsShop() {
 }
 
 function ccsToken() {
-  const cache = CacheService.getScriptCache();
-  const cached = cache.get('shopify_admin_token');
-  if (cached) return cached;
-
-  const url = 'https://' + ccsShop() + '.myshopify.com/admin/oauth/' + 'access' + '_token';
-  const payload = {
-    grant_type: 'client' + '_credentials',
-    client_id: ccsGet('SHOPIFY_CLIENT_ID')
-  };
-  payload['client' + '_secret'] = ccsGet('SHOPIFY_CLIENT_SECRET');
-
-  const res = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-  const body = JSON.parse(res.getContentText());
-  if (res.getResponseCode() >= 300 || !body['access' + '_token']) {
-    throw new Error('Shopify token error: ' + res.getContentText());
-  }
-  const token = body['access' + '_token'];
-  cache.put('shopify_admin_token', token, Math.min(Number(body.expires_in || 3600) - 60, 21600));
-  return token;
+  return ccsGet('SHOPIFY_ADMIN_API_ACCESS_TOKEN');
 }
 
 function ccsGraphql(query, variables) {
@@ -100,8 +77,14 @@ function ccsGraphql(query, variables) {
     payload: JSON.stringify({ query: query, variables: variables || {} }),
     muteHttpExceptions: true
   });
-  const body = JSON.parse(res.getContentText());
-  if (res.getResponseCode() >= 300 || body.errors) throw new Error('Shopify GraphQL error: ' + res.getContentText());
+  const text = res.getContentText();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch (err) {
+    throw new Error('Shopify returned non-JSON. Check SHOPIFY_SHOP and SHOPIFY_ADMIN_API_ACCESS_TOKEN. First 300 chars: ' + text.slice(0, 300));
+  }
+  if (res.getResponseCode() >= 300 || body.errors) throw new Error('Shopify GraphQL error: ' + text);
   return body.data;
 }
 
