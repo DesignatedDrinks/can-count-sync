@@ -207,7 +207,34 @@ function ccsPromoteMappings() {
     last_seen_at: new Date()
   })).filter(r => r.base_sku && r.pack_size && r.inventory_item_id);
   ccsAppend(CCS.tabs.variants, CCS.headers.variants, rows);
-  SpreadsheetApp.getUi().alert('Promoted ' + rows.length + ' rows.');
+  const baseCreated = ccsEnsureBaseProductsFromPromotedRows(rows);
+  SpreadsheetApp.getUi().alert('Promoted ' + rows.length + ' variant rows. Created ' + baseCreated + ' Base Products placeholder rows. Add real opening_cans before live sync.');
+}
+
+function ccsEnsureBaseProductsFromPromotedRows(variantRows) {
+  const existing = {};
+  ccsRead(CCS.tabs.base).forEach(r => {
+    const base = String(r.base_sku || '').trim();
+    if (base) existing[base] = true;
+  });
+
+  const createdMap = {};
+  variantRows.forEach(r => {
+    const base = String(r.base_sku || '').trim();
+    if (!base || existing[base] || createdMap[base]) return;
+    createdMap[base] = {
+      base_sku: base,
+      product_name: r.product_title || base,
+      case_size: '',
+      opening_cans: 0,
+      safety_buffer_cans: 0,
+      active: 'TRUE'
+    };
+  });
+
+  const rows = Object.keys(createdMap).map(k => createdMap[k]);
+  ccsAppend(CCS.tabs.base, CCS.headers.base, rows);
+  return rows.length;
 }
 
 function ccsBaseInventory() {
