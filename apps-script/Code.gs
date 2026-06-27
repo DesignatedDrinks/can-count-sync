@@ -198,7 +198,8 @@ function ccsPackTarget(totalCans, packSize) {
   if (packSize === 1) return totalCans;
   if (packSize >= 12) {
     if (totalCans < 20) return 0;
-    return Math.max(1, Math.floor(totalCans / 24));
+    if (totalCans < 36) return 1;
+    return 2 + Math.floor((totalCans - 36) / 24);
   }
   if (totalCans < packSize * 2) return 0;
   if (totalCans < 24) return Math.floor((totalCans - packSize) / packSize);
