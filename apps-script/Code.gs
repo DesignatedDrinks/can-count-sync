@@ -18,6 +18,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Process Recent Orders + Sync', 'ccsProcessRecentOrders')
     .addItem('Install 10 Minute Order Polling', 'ccsInstallOrderPolling')
+    .addItem('Clean Sync Log', 'ccsCleanSyncLog')
     .addToUi();
 }
 
@@ -101,6 +102,23 @@ function ccsAppend(tabName, headers, rows) {
   let sh = SpreadsheetApp.getActive().getSheetByName(tabName);
   if (!sh) { sh = SpreadsheetApp.getActive().insertSheet(tabName); sh.getRange(1, 1, 1, headers.length).setValues([headers]); }
   sh.getRange(sh.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows.map(o => headers.map(h => o[h] === undefined ? '' : o[h])));
+}
+
+function ccsTrimLogRows(tabName, maxRows) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(tabName);
+  if (!sh) return 0;
+  const keep = Math.max(100, Number(maxRows || 2000));
+  const lastRow = sh.getLastRow();
+  const maxWithHeader = keep + 1;
+  if (lastRow <= maxWithHeader) return 0;
+  const removeCount = lastRow - maxWithHeader;
+  sh.deleteRows(2, removeCount);
+  return removeCount;
+}
+
+function ccsCleanSyncLog() {
+  const removed = ccsTrimLogRows(CCS.tabs.log, Number(ccsGet('SYNC_LOG_MAX_ROWS', '2000')));
+  SpreadsheetApp.getUi().alert('Sync Log cleaned. Removed ' + removed + ' old rows. Orders Processed was not touched.');
 }
 
 function ccsAvailableFromNode(v) {
@@ -207,6 +225,7 @@ function ccsPackTarget(totalCans, packSize) {
 }
 
 function ccsRunPackSync(mode, silent) {
+  const quietAuto = Boolean(silent) && mode === 'live';
   const rows = ccsRefreshMappingRows(false);
   const groups = {};
   rows.forEach(r => {
@@ -222,7 +241,7 @@ function ccsRunPackSync(mode, silent) {
     const groupRows = groups[group];
     const source = ccsFindSingleSource(groupRows);
     if (!source) {
-      logRows.push({ timestamp: new Date(), mode, sync_group: group, status: 'skipped', message: 'No active tracked Single Can source row found' });
+      if (!quietAuto) logRows.push({ timestamp: new Date(), mode, sync_group: group, status: 'skipped', message: 'No active tracked Single Can source row found' });
       return;
     }
 
@@ -230,7 +249,7 @@ function ccsRunPackSync(mode, silent) {
     groupRows.forEach(r => {
       const pack = ccsNumber(r.pack_size);
       if (!pack || !r.inventory_item_id || !ccsYes(r.tracked)) {
-        logRows.push({ timestamp: new Date(), mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: r.pack_size, shopify_available: r.shopify_available, status: 'skipped', message: 'Missing pack_size, inventory_item_id, or tracked=FALSE' });
+        if (!quietAuto) logRows.push({ timestamp: new Date(), mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: r.pack_size, shopify_available: r.shopify_available, status: 'skipped', message: 'Missing pack_size, inventory_item_id, or tracked=FALSE' });
         return;
       }
 
@@ -257,12 +276,14 @@ function ccsRunPackSync(mode, silent) {
         }
       }
 
-      logRows.push({ timestamp: new Date(), mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: pack, shopify_available: current, target_available: target, status, message });
+      const logRow = { timestamp: new Date(), mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: pack, shopify_available: current, target_available: target, status, message };
+      if (!quietAuto || status === 'success' || status === 'error') logRows.push(logRow);
     });
   });
 
   ccsWriteRows(CCS.tabs.mapping, CCS.headers.mapping, rows);
   ccsAppend(CCS.tabs.log, CCS.headers.log, logRows);
+  ccsTrimLogRows(CCS.tabs.log, Number(ccsGet('SYNC_LOG_MAX_ROWS', '2000')));
   if (!silent) SpreadsheetApp.getUi().alert(mode === 'live' ? 'Live safe pack sync complete. Check Sync Log.' : 'Preview complete. Check target_available and Sync Log.');
 }
 
@@ -340,5 +361,5 @@ function ccsProcessRecentOrders() {
 function ccsInstallOrderPolling() {
   ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === 'ccsProcessRecentOrders') ScriptApp.deleteTrigger(t); });
   ScriptApp.newTrigger('ccsProcessRecentOrders').timeBased().everyMinutes(10).create();
-  SpreadsheetApp.getUi().alert('10 minute order polling is installed. Pack sales deduct cans from the Single Can source, then safe pack inventory syncs.');
+  SpreadsheetApp.getUi().alert('10 minute order polling is installed. Pack sales deduct cans from the Single Can source, then safe pack inventory syncs. Automatic runs only log real updates, errors, and order deductions.');
 }
