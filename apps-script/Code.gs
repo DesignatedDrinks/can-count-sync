@@ -1,18 +1,12 @@
 const CCS = {
   tabs: {
-    base: 'Base Products',
-    variants: 'Shopify Variants',
-    ledger: 'Can Ledger',
-    needs: 'Needs Mapping',
-    syncLog: 'Sync Log',
+    mapping: 'Pack Mapping',
+    log: 'Sync Log',
     orders: 'Orders Processed'
   },
   headers: {
-    base: ['base_sku', 'product_name', 'case_size', 'opening_cans', 'safety_buffer_cans', 'active'],
-    variants: ['base_sku', 'product_title', 'variant_title', 'sku', 'price', 'variant_gid', 'variant_legacy_id', 'inventory_item_id', 'pack_size', 'active', 'tracked', 'last_seen_at'],
-    ledger: ['timestamp', 'base_sku', 'change_cans', 'reason', 'reference_type', 'reference_id', 'note', 'source'],
-    needs: ['status', 'product_title', 'variant_title', 'sku', 'price', 'proposed_base_sku', 'proposed_pack_size', 'variant_gid', 'variant_legacy_id', 'inventory_item_id', 'tracked', 'last_seen_at', 'note'],
-    syncLog: ['timestamp', 'mode', 'base_sku', 'product_title', 'variant_title', 'pack_size', 'available_cans', 'target_quantity', 'status', 'message'],
+    mapping: ['sync_group', 'product_title', 'variant_title', 'sku', 'variant_gid', 'inventory_item_id', 'pack_size', 'is_master', 'active', 'shopify_available', 'target_available', 'tracked', 'last_seen_at', 'notes'],
+    log: ['timestamp', 'mode', 'sync_group', 'product_title', 'variant_title', 'pack_size', 'shopify_available', 'target_available', 'status', 'message'],
     orders: ['timestamp', 'shopify_order_id', 'shopify_order_name', 'status', 'note']
   }
 };
@@ -20,15 +14,13 @@ const CCS = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Can Count Sync')
-    .addItem('Setup / Repair Sheet Tabs', 'ccsSetupTabs')
+    .addItem('Setup Simple Tabs', 'ccsSetupTabs')
     .addSeparator()
-    .addItem('Import Shopify Variants', 'ccsImportShopifyVariants')
-    .addItem('Promote Ready Mapping Rows', 'ccsPromoteMappings')
+    .addItem('Import / Refresh Shopify Variants', 'ccsImportOrRefreshMapping')
+    .addItem('Preview Pack Sync', 'ccsPreviewPackSync')
+    .addItem('Sync Pack Variants to Shopify', 'ccsLivePackSync')
     .addSeparator()
-    .addItem('Preview Inventory Sync', 'ccsPreviewInventorySync')
-    .addItem('Sync Inventory to Shopify', 'ccsSyncInventoryToShopify')
-    .addSeparator()
-    .addItem('Process Recent Orders', 'ccsProcessRecentOrders')
+    .addItem('Process Recent Orders + Sync', 'ccsProcessRecentOrders')
     .addItem('Install 10 Minute Order Polling', 'ccsInstallOrderPolling')
     .addToUi();
 }
@@ -42,16 +34,21 @@ function ccsSetupTabs() {
     sh.getRange(1, 1, 1, headers.length).setValues([headers]);
     sh.setFrozenRows(1);
   });
-  SpreadsheetApp.getUi().alert('Can Count Sync tabs are ready.');
+  SpreadsheetApp.getUi().alert('Simple Can Count Sync tabs are ready. Use Pack Mapping only. Old Base Products / Ledger tabs can be ignored.');
 }
 
 function ccsProps() {
   return PropertiesService.getScriptProperties();
 }
 
-function ccsGet(name, fallback) {
+function ccsOptional(name) {
   const value = ccsProps().getProperty(name);
-  if (value === null || value === '') {
+  return value === null ? '' : String(value).trim();
+}
+
+function ccsGet(name, fallback) {
+  const value = ccsOptional(name);
+  if (value === '') {
     if (fallback !== undefined) return fallback;
     throw new Error('Missing script property: ' + name);
   }
@@ -63,7 +60,42 @@ function ccsShop() {
 }
 
 function ccsToken() {
-  return ccsGet('SHOPIFY_ADMIN_API_ACCESS_TOKEN');
+  const directToken = ccsOptional('SHOPIFY_ADMIN_API_ACCESS_TOKEN');
+  if (directToken) return directToken;
+
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('shopify_admin_token');
+  if (cached) return cached;
+
+  const url = 'https://' + ccsShop() + '.myshopify.com/admin/oauth/' + 'access' + '_token';
+  const payload = {
+    grant_type: 'client' + '_credentials',
+    client_id: ccsGet('SHOPIFY_CLIENT_ID')
+  };
+  payload['client' + '_secret'] = ccsGet('SHOPIFY_CLIENT_SECRET');
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const text = res.getContentText();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch (err) {
+    throw new Error('Shopify returned non-JSON during token request. Make sure the app is installed and SHOPIFY_SHOP is correct. First 300 chars: ' + text.slice(0, 300));
+  }
+
+  if (res.getResponseCode() >= 300 || !body['access' + '_token']) {
+    throw new Error('Shopify token error: ' + text);
+  }
+
+  const token = body['access' + '_token'];
+  cache.put('shopify_admin_token', token, Math.min(Number(body.expires_in || 3600) - 60, 21600));
+  return token;
 }
 
 function ccsGraphql(query, variables) {
@@ -82,7 +114,7 @@ function ccsGraphql(query, variables) {
   try {
     body = JSON.parse(text);
   } catch (err) {
-    throw new Error('Shopify returned non-JSON. Check SHOPIFY_SHOP and SHOPIFY_ADMIN_API_ACCESS_TOKEN. First 300 chars: ' + text.slice(0, 300));
+    throw new Error('Shopify returned non-JSON. Check app install and shop value. First 300 chars: ' + text.slice(0, 300));
   }
   if (res.getResponseCode() >= 300 || body.errors) throw new Error('Shopify GraphQL error: ' + text);
   return body.data;
@@ -101,6 +133,18 @@ function ccsRead(tabName) {
   });
 }
 
+function ccsWriteRows(tabName, headers, rows) {
+  let sh = SpreadsheetApp.getActive().getSheetByName(tabName);
+  if (!sh) sh = SpreadsheetApp.getActive().insertSheet(tabName);
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length) {
+    const values = rows.map(obj => headers.map(h => obj[h] === undefined ? '' : obj[h]));
+    sh.getRange(2, 1, values.length, headers.length).setValues(values);
+  }
+  sh.setFrozenRows(1);
+}
+
 function ccsAppend(tabName, headers, rows) {
   if (!rows.length) return;
   let sh = SpreadsheetApp.getActive().getSheetByName(tabName);
@@ -114,7 +158,7 @@ function ccsAppend(tabName, headers, rows) {
 
 function ccsYes(v) {
   const s = String(v === undefined ? '' : v).trim().toLowerCase();
-  return s !== 'false' && s !== '0' && s !== 'no';
+  return s === 'true' || s === 'yes' || s === '1' || s === 'y';
 }
 
 function ccsNumber(v) {
@@ -122,231 +166,281 @@ function ccsNumber(v) {
   return isNaN(n) ? 0 : n;
 }
 
-function ccsLegacyId(gid) {
-  const m = String(gid || '').match(/\/(\d+)$/);
-  return m ? m[1] : '';
+function ccsAvailableFromNode(v) {
+  const level = v.inventoryItem && v.inventoryItem.inventoryLevel;
+  const quantities = level && level.quantities ? level.quantities : [];
+  for (let i = 0; i < quantities.length; i++) {
+    if (quantities[i].name === 'available') return Number(quantities[i].quantity || 0);
+  }
+  return 0;
 }
 
 function ccsInferPackSize(title, sku) {
   const text = (String(title || '') + ' ' + String(sku || '')).toLowerCase();
+  if (text.indexOf('24-pack') >= 0 || text.indexOf('24 pack') >= 0 || text.indexOf('24pk') >= 0) return 24;
   if (text.indexOf('12-pack') >= 0 || text.indexOf('12 pack') >= 0 || text.indexOf('12pk') >= 0) return 12;
   if (text.indexOf('6-pack') >= 0 || text.indexOf('6 pack') >= 0 || text.indexOf('6pk') >= 0) return 6;
   if (text.indexOf('4-pack') >= 0 || text.indexOf('4 pack') >= 0 || text.indexOf('4pk') >= 0) return 4;
-  if (text.indexOf('24-pack') >= 0 || text.indexOf('24 pack') >= 0 || text.indexOf('24pk') >= 0) return 24;
-  if (text.indexOf('single') >= 0) return 1;
+  if (text.indexOf('single') >= 0 || text.indexOf('1-pack') >= 0 || text.indexOf('1 pack') >= 0) return 1;
   return '';
 }
 
-function ccsProposeBaseSku(productTitle, sku) {
-  return String(sku || productTitle || '').toUpperCase()
-    .replace('SINGLE', '')
-    .replace('4PK', '')
-    .replace('12PK', '')
-    .replace('4-PACK', '')
-    .replace('12-PACK', '')
+function ccsProposeGroup(productTitle, sku) {
+  return String(productTitle || sku || '').toUpperCase()
+    .replace(/\(NON-ALCOHOLIC\)/g, '')
     .replace(/[^A-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 60);
 }
 
-function ccsImportShopifyVariants() {
-  ccsSetupTabs();
-  const existing = ccsRead(CCS.tabs.variants).concat(ccsRead(CCS.tabs.needs));
-  const known = {};
-  existing.forEach(r => {
-    if (r.variant_gid) known[String(r.variant_gid)] = true;
-    if (r.variant_legacy_id) known[String(r.variant_legacy_id)] = true;
-  });
-
-  const query = 'query ProductVariants($cursor: String) { productVariants(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { id legacyResourceId title sku price product { title handle } inventoryItem { id sku tracked } } } }';
+function ccsFetchShopifyVariants() {
+  const query = 'query ProductVariants($cursor: String, $locationId: ID!) { productVariants(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { id title sku price product { title } inventoryItem { id sku tracked inventoryLevel(locationId: $locationId) { quantities(names: ["available"]) { name quantity } } } } } }';
   let cursor = null;
   const rows = [];
   do {
-    const data = ccsGraphql(query, { cursor: cursor });
+    const data = ccsGraphql(query, { cursor: cursor, locationId: ccsGet('SHOPIFY_LOCATION_ID') });
     data.productVariants.nodes.forEach(v => {
-      const legacy = ccsLegacyId(v.id) || v.legacyResourceId || '';
-      if (known[v.id] || known[legacy]) return;
-      const sku = v.sku || (v.inventoryItem && v.inventoryItem.sku) || '';
+      const productTitle = v.product ? v.product.title : '';
       rows.push({
-        status: 'needs_mapping',
-        product_title: v.product ? v.product.title : '',
+        product_title: productTitle,
         variant_title: v.title || '',
-        sku: sku,
-        price: v.price || '',
-        proposed_base_sku: ccsProposeBaseSku(v.product ? v.product.title : '', sku),
-        proposed_pack_size: ccsInferPackSize(v.title, sku),
+        sku: v.sku || (v.inventoryItem && v.inventoryItem.sku) || '',
         variant_gid: v.id || '',
-        variant_legacy_id: legacy,
         inventory_item_id: v.inventoryItem ? v.inventoryItem.id : '',
-        tracked: v.inventoryItem && v.inventoryItem.tracked ? 'TRUE' : 'FALSE',
-        last_seen_at: new Date(),
-        note: 'Confirm base SKU and pack size, then set status to ready_to_promote.'
+        shopify_available: ccsAvailableFromNode(v),
+        tracked: v.inventoryItem && v.inventoryItem.tracked ? 'TRUE' : 'FALSE'
       });
     });
     cursor = data.productVariants.pageInfo.hasNextPage ? data.productVariants.pageInfo.endCursor : null;
   } while (cursor);
-
-  ccsAppend(CCS.tabs.needs, CCS.headers.needs, rows);
-  SpreadsheetApp.getUi().alert('Imported ' + rows.length + ' new variants into Needs Mapping.');
+  return rows;
 }
 
-function ccsPromoteMappings() {
-  const ready = ccsRead(CCS.tabs.needs).filter(r => String(r.status).trim().toLowerCase() === 'ready_to_promote');
-  const rows = ready.map(r => ({
-    base_sku: r.proposed_base_sku,
-    product_title: r.product_title,
-    variant_title: r.variant_title,
-    sku: r.sku,
-    price: r.price,
-    variant_gid: r.variant_gid,
-    variant_legacy_id: r.variant_legacy_id,
-    inventory_item_id: r.inventory_item_id,
-    pack_size: r.proposed_pack_size,
-    active: 'TRUE',
-    tracked: r.tracked || 'TRUE',
-    last_seen_at: new Date()
-  })).filter(r => r.base_sku && r.pack_size && r.inventory_item_id);
-  ccsAppend(CCS.tabs.variants, CCS.headers.variants, rows);
-  const baseCreated = ccsEnsureBaseProductsFromPromotedRows(rows);
-  SpreadsheetApp.getUi().alert('Promoted ' + rows.length + ' variant rows. Created ' + baseCreated + ' Base Products placeholder rows. Add real opening_cans before live sync.');
+function ccsImportOrRefreshMapping() {
+  const rows = ccsRefreshMappingRows(true);
+  SpreadsheetApp.getUi().alert('Pack Mapping refreshed with ' + rows.length + ' Shopify variants. Set active=TRUE only for products you want Can Count Sync to manage.');
 }
 
-function ccsEnsureBaseProductsFromPromotedRows(variantRows) {
+function ccsRefreshMappingRows(writeSheet) {
+  ccsSetupTabsSilent();
   const existing = {};
-  ccsRead(CCS.tabs.base).forEach(r => {
-    const base = String(r.base_sku || '').trim();
-    if (base) existing[base] = true;
+  ccsRead(CCS.tabs.mapping).forEach(r => {
+    if (r.variant_gid) existing[String(r.variant_gid)] = r;
   });
 
-  const createdMap = {};
-  variantRows.forEach(r => {
-    const base = String(r.base_sku || '').trim();
-    if (!base || existing[base] || createdMap[base]) return;
-    createdMap[base] = {
-      base_sku: base,
-      product_name: r.product_title || base,
-      case_size: '',
-      opening_cans: 0,
-      safety_buffer_cans: 0,
-      active: 'TRUE'
+  const live = ccsFetchShopifyVariants();
+  const rows = live.map(v => {
+    const old = existing[String(v.variant_gid)] || {};
+    const inferredPack = ccsInferPackSize(v.variant_title, v.sku);
+    const packSize = old.pack_size || inferredPack;
+    return {
+      sync_group: old.sync_group || ccsProposeGroup(v.product_title, v.sku),
+      product_title: v.product_title,
+      variant_title: v.variant_title,
+      sku: v.sku,
+      variant_gid: v.variant_gid,
+      inventory_item_id: v.inventory_item_id,
+      pack_size: packSize,
+      is_master: old.is_master || (String(packSize) === '1' ? 'TRUE' : 'FALSE'),
+      active: old.active || 'FALSE',
+      shopify_available: v.shopify_available,
+      target_available: old.target_available || '',
+      tracked: v.tracked,
+      last_seen_at: new Date(),
+      notes: old.notes || ''
     };
   });
 
-  const rows = Object.keys(createdMap).map(k => createdMap[k]);
-  ccsAppend(CCS.tabs.base, CCS.headers.base, rows);
-  return rows.length;
+  rows.sort((a, b) => {
+    const p = String(a.product_title).localeCompare(String(b.product_title));
+    if (p !== 0) return p;
+    return ccsNumber(a.pack_size) - ccsNumber(b.pack_size);
+  });
+
+  if (writeSheet) ccsWriteRows(CCS.tabs.mapping, CCS.headers.mapping, rows);
+  return rows;
 }
 
-function ccsBaseInventory() {
-  const baseRows = ccsRead(CCS.tabs.base);
-  const ledger = ccsRead(CCS.tabs.ledger);
-  const map = {};
-  baseRows.forEach(r => {
-    const base = String(r.base_sku || '').trim();
-    if (!base || !ccsYes(r.active)) return;
-    map[base] = {
-      base_sku: base,
-      product_name: r.product_name || base,
-      opening_cans: ccsNumber(r.opening_cans),
-      ledger_change: 0,
-      safety_buffer_cans: ccsNumber(r.safety_buffer_cans),
-      available_cans: 0
-    };
+function ccsSetupTabsSilent() {
+  const ss = SpreadsheetApp.getActive();
+  Object.keys(CCS.tabs).forEach(key => {
+    let sh = ss.getSheetByName(CCS.tabs[key]);
+    if (!sh) {
+      sh = ss.insertSheet(CCS.tabs[key]);
+      sh.getRange(1, 1, 1, CCS.headers[key].length).setValues([CCS.headers[key]]);
+      sh.setFrozenRows(1);
+    }
   });
-  ledger.forEach(r => {
-    const base = String(r.base_sku || '').trim();
-    if (map[base]) map[base].ledger_change += ccsNumber(r.change_cans);
-  });
-  Object.keys(map).forEach(base => {
-    const item = map[base];
-    item.available_cans = Math.max(0, Math.floor(item.opening_cans + item.ledger_change - item.safety_buffer_cans));
-  });
-  return map;
 }
 
-function ccsTargets() {
-  const inv = ccsBaseInventory();
-  return ccsRead(CCS.tabs.variants).filter(v => ccsYes(v.active) && ccsYes(v.tracked)).map(v => {
-    const base = inv[String(v.base_sku || '').trim()];
-    const pack = ccsNumber(v.pack_size);
-    if (!base || !pack || !v.inventory_item_id) return null;
-    return Object.assign({}, v, {
-      available_cans: base.available_cans,
-      target_quantity: Math.floor(base.available_cans / pack)
+function ccsPreviewPackSync() {
+  ccsRunPackSync('preview');
+}
+
+function ccsLivePackSync() {
+  ccsRunPackSync('live');
+}
+
+function ccsFindMaster(groupRows) {
+  const active = groupRows.filter(r => ccsYes(r.active) && ccsYes(r.tracked));
+  let master = active.find(r => ccsYes(r.is_master));
+  if (master) return master;
+  master = active.find(r => ccsNumber(r.pack_size) === 1);
+  if (master) return master;
+  active.sort((a, b) => ccsNumber(a.pack_size) - ccsNumber(b.pack_size));
+  return active[0] || null;
+}
+
+function ccsRunPackSync(mode) {
+  const rows = ccsRefreshMappingRows(false);
+  const groups = {};
+  rows.forEach(r => {
+    if (!ccsYes(r.active)) return;
+    const group = String(r.sync_group || '').trim();
+    if (!group) return;
+    if (!groups[group]) groups[group] = [];
+    groups[group].push(r);
+  });
+
+  const logRows = [];
+  Object.keys(groups).forEach(group => {
+    const groupRows = groups[group];
+    const master = ccsFindMaster(groupRows);
+    if (!master) {
+      logRows.push({ timestamp: new Date(), mode: mode, sync_group: group, status: 'skipped', message: 'No active tracked master row found' });
+      return;
+    }
+
+    const masterPack = ccsNumber(master.pack_size);
+    const masterQty = ccsNumber(master.shopify_available);
+    if (!masterPack) {
+      logRows.push({ timestamp: new Date(), mode: mode, sync_group: group, status: 'skipped', message: 'Master pack_size missing' });
+      return;
+    }
+
+    const totalCans = masterQty * masterPack;
+    groupRows.forEach(r => {
+      const pack = ccsNumber(r.pack_size);
+      if (!pack || !r.inventory_item_id || !ccsYes(r.tracked)) {
+        logRows.push({ timestamp: new Date(), mode: mode, sync_group: group, product_title: r.product_title, variant_title: r.variant_title, pack_size: r.pack_size, shopify_available: r.shopify_available, status: 'skipped', message: 'Missing pack_size, inventory_item_id, or tracked=FALSE' });
+        return;
+      }
+
+      const target = Math.floor(totalCans / pack);
+      r.target_available = target;
+      let status = 'preview';
+      let message = 'No Shopify update made';
+
+      if (mode === 'live') {
+        try {
+          if (ccsNumber(r.shopify_available) !== target) {
+            ccsSetInventory(r.inventory_item_id, target);
+            r.shopify_available = target;
+            status = 'success';
+            message = 'Updated Shopify inventory';
+          } else {
+            status = 'unchanged';
+            message = 'Already correct';
+          }
+        } catch (err) {
+          status = 'error';
+          message = err.message;
+        }
+      }
+
+      logRows.push({
+        timestamp: new Date(),
+        mode: mode,
+        sync_group: group,
+        product_title: r.product_title,
+        variant_title: r.variant_title,
+        pack_size: pack,
+        shopify_available: r.shopify_available,
+        target_available: target,
+        status: status,
+        message: message
+      });
     });
-  }).filter(Boolean);
+  });
+
+  ccsWriteRows(CCS.tabs.mapping, CCS.headers.mapping, rows);
+  ccsAppend(CCS.tabs.log, CCS.headers.log, logRows);
+  SpreadsheetApp.getUi().alert(mode === 'live' ? 'Live pack sync complete. Check Sync Log.' : 'Preview complete. Check target_available and Sync Log.');
 }
 
-function ccsPreviewInventorySync() {
-  const targets = ccsTargets();
-  const rows = targets.map(t => ({
-    timestamp: new Date(), mode: 'preview', base_sku: t.base_sku, product_title: t.product_title, variant_title: t.variant_title, pack_size: t.pack_size, available_cans: t.available_cans, target_quantity: t.target_quantity, status: 'preview', message: 'No Shopify update made'
-  }));
-  ccsAppend(CCS.tabs.syncLog, CCS.headers.syncLog, rows);
-  SpreadsheetApp.getUi().alert('Preview complete. Rows written to Sync Log: ' + rows.length);
-}
-
-function ccsSetInventory(t) {
+function ccsSetInventory(inventoryItemId, quantity) {
   const mutation = 'mutation InventorySet($input: InventorySetQuantitiesInput!) { inventorySetQuantities(input: $input) { userErrors { field message code } } }';
   const input = {
     name: 'available',
-    reason: 'can-count-sync',
+    reason: 'correction',
     referenceDocumentUri: 'can-count-sync://' + new Date().getTime(),
-    quantities: [{ inventoryItemId: t.inventory_item_id, locationId: ccsGet('SHOPIFY_LOCATION_ID'), quantity: Number(t.target_quantity) }]
+    quantities: [{ inventoryItemId: inventoryItemId, locationId: ccsGet('SHOPIFY_LOCATION_ID'), quantity: Number(quantity) }]
   };
   const data = ccsGraphql(mutation, { input: input });
   const errors = data.inventorySetQuantities.userErrors || [];
   if (errors.length) throw new Error(JSON.stringify(errors));
 }
 
-function ccsSyncInventoryToShopify() {
-  const targets = ccsTargets();
-  const rows = [];
-  targets.forEach(t => {
-    try {
-      ccsSetInventory(t);
-      rows.push({ timestamp: new Date(), mode: 'live', base_sku: t.base_sku, product_title: t.product_title, variant_title: t.variant_title, pack_size: t.pack_size, available_cans: t.available_cans, target_quantity: t.target_quantity, status: 'success', message: 'Updated Shopify inventory' });
-    } catch (err) {
-      rows.push({ timestamp: new Date(), mode: 'live', base_sku: t.base_sku, product_title: t.product_title, variant_title: t.variant_title, pack_size: t.pack_size, available_cans: t.available_cans, target_quantity: t.target_quantity, status: 'error', message: err.message });
-    }
-  });
-  ccsAppend(CCS.tabs.syncLog, CCS.headers.syncLog, rows);
-  SpreadsheetApp.getUi().alert('Live sync complete. Check Sync Log.');
-}
-
 function ccsProcessRecentOrders() {
-  const hours = Number(ccsGet('ORDER_LOOKBACK_HOURS', '24'));
-  const since = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
-  const query = 'query Orders($q: String!) { orders(first: 50, query: $q, sortKey: CREATED_AT, reverse: true) { nodes { id name createdAt lineItems(first: 100) { nodes { quantity variant { id legacyResourceId title } } } } } }';
-  const data = ccsGraphql(query, { q: 'created_at:>=' + since });
+  let rows = ccsRefreshMappingRows(false);
+  const activeByVariant = {};
+  const groups = {};
+  rows.forEach(r => {
+    if (!ccsYes(r.active)) return;
+    activeByVariant[String(r.variant_gid)] = r;
+    const group = String(r.sync_group || '').trim();
+    if (!groups[group]) groups[group] = [];
+    groups[group].push(r);
+  });
 
   const processed = {};
   ccsRead(CCS.tabs.orders).forEach(r => processed[String(r.shopify_order_id)] = true);
 
-  const variants = {};
-  ccsRead(CCS.tabs.variants).forEach(v => {
-    variants[String(v.variant_gid)] = v;
-    variants[String(v.variant_legacy_id)] = v;
-  });
+  const hours = Number(ccsGet('ORDER_LOOKBACK_HOURS', '24'));
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const query = 'query Orders($q: String!) { orders(first: 50, query: $q, sortKey: CREATED_AT, reverse: true) { nodes { id name createdAt lineItems(first: 100) { nodes { quantity variant { id title } } } } } }';
+  const data = ccsGraphql(query, { q: 'created_at:>=' + since });
 
-  const ledgerRows = [];
+  const adjustments = {};
   const orderRows = [];
   data.orders.nodes.forEach(order => {
     if (processed[String(order.id)]) return;
     order.lineItems.nodes.forEach(line => {
-      const v = line.variant || {};
-      const match = variants[String(v.id)] || variants[String(v.legacyResourceId)];
-      if (!match) return;
-      const cans = Number(line.quantity) * Number(match.pack_size || 0);
-      if (!cans) return;
-      ledgerRows.push({ timestamp: new Date(), base_sku: match.base_sku, change_cans: -cans, reason: 'order', reference_type: 'shopify_order', reference_id: order.id, note: order.name + ' - ' + line.quantity + ' x ' + match.variant_title, source: 'order_polling' });
+      const variantId = line.variant ? String(line.variant.id) : '';
+      const sold = activeByVariant[variantId];
+      if (!sold) return;
+      const group = String(sold.sync_group || '').trim();
+      const master = ccsFindMaster(groups[group] || []);
+      if (!master) return;
+      if (String(master.variant_gid) === String(sold.variant_gid)) return;
+
+      const soldPack = ccsNumber(sold.pack_size);
+      const masterPack = ccsNumber(master.pack_size);
+      if (!soldPack || !masterPack) return;
+      const unitsToDeductFromMaster = Math.ceil(Number(line.quantity || 0) * soldPack / masterPack);
+      if (!adjustments[master.variant_gid]) adjustments[master.variant_gid] = { row: master, quantity: 0, notes: [] };
+      adjustments[master.variant_gid].quantity += unitsToDeductFromMaster;
+      adjustments[master.variant_gid].notes.push(order.name + ' sold ' + line.quantity + ' x ' + sold.variant_title);
     });
-    orderRows.push({ timestamp: new Date(), shopify_order_id: order.id, shopify_order_name: order.name, status: 'processed', note: 'Order polling processed' });
+    orderRows.push({ timestamp: new Date(), shopify_order_id: order.id, shopify_order_name: order.name, status: 'processed', note: 'Checked by Can Count Sync' });
   });
 
-  ccsAppend(CCS.tabs.ledger, CCS.headers.ledger, ledgerRows);
+  const logRows = [];
+  Object.keys(adjustments).forEach(key => {
+    const adj = adjustments[key];
+    const current = ccsNumber(adj.row.shopify_available);
+    const next = Math.max(0, current - adj.quantity);
+    try {
+      ccsSetInventory(adj.row.inventory_item_id, next);
+      logRows.push({ timestamp: new Date(), mode: 'order_adjust', sync_group: adj.row.sync_group, product_title: adj.row.product_title, variant_title: adj.row.variant_title, pack_size: adj.row.pack_size, shopify_available: current, target_available: next, status: 'success', message: 'Master adjusted for pack order: ' + adj.notes.join('; ') });
+    } catch (err) {
+      logRows.push({ timestamp: new Date(), mode: 'order_adjust', sync_group: adj.row.sync_group, product_title: adj.row.product_title, variant_title: adj.row.variant_title, pack_size: adj.row.pack_size, shopify_available: current, target_available: next, status: 'error', message: err.message });
+    }
+  });
+
   ccsAppend(CCS.tabs.orders, CCS.headers.orders, orderRows);
-  ccsSyncInventoryToShopify();
+  ccsAppend(CCS.tabs.log, CCS.headers.log, logRows);
+  ccsRunPackSync('live');
 }
 
 function ccsInstallOrderPolling() {
@@ -354,5 +448,5 @@ function ccsInstallOrderPolling() {
     if (t.getHandlerFunction() === 'ccsProcessRecentOrders') ScriptApp.deleteTrigger(t);
   });
   ScriptApp.newTrigger('ccsProcessRecentOrders').timeBased().everyMinutes(10).create();
-  SpreadsheetApp.getUi().alert('10 minute order polling is installed.');
+  SpreadsheetApp.getUi().alert('10 minute order polling is installed. It will process recent orders and then sync related pack variants.');
 }
